@@ -103,7 +103,7 @@
         async function run(){
           setBusy(true); setLog('');
           try {
-            const fm = new FaceMesh.FaceMesh({
+            const fm = new FaceMesh({
               locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`
             });
             fm.setOptions({ maxNumFaces:1, refineLandmarks:true, minDetectionConfidence:0.5, minTrackingConfidence:0.5 });
@@ -123,7 +123,7 @@
               const lms = res.multiFaceLandmarks?.[0];
               if(!lms){ return null; }
               // draw landmarks for debug
-              FaceMesh.drawConnectors(ctx, lms, FaceMesh.FACEMESH_TESSELATION, {color:'#00000033', lineWidth:0.5});
+              drawConnectors(ctx, lms, FACEMESH_TESSELATION, { color:'#00000033', lineWidth:0.5 });
               return { lms, w, h };
             };
 
