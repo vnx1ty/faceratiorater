@@ -15,7 +15,7 @@
   <body class="bg-gray-100">
     <div id="root"></div>
     <script type="text/babel">
-import React, { useEffect, useRef, useState } from "react";
+const { useEffect, useRef, useState } = React;
 
 // This single-file React app uses face-api.js (loaded from CDN at runtime)
 // to detect 68 facial landmarks on a FRONT and a SIDE profile photo, then
@@ -55,7 +55,7 @@ import React, { useEffect, useRef, useState } from "react";
 
 const CDN = {
   faceapi: "https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js",
-  models: "https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/", // 68-landmark compatible
+   models: "https://justadudewhohacks.github.io/face-api.js/models",
 };
 
 // Utility: load a script tag once
@@ -453,7 +453,6 @@ function App() {
         return r !== 0 ? r : a.id - b.id;
       });
 
-      
       // Compute weighted overall score (1-10)
       const weights = { RED: 3, BLUE: 2, GREEN: 1, WHITE: 0.5 };
       const valid = nextMetrics.filter(m => Number.isFinite(m.value));
@@ -529,8 +528,7 @@ function App() {
           <div className="p-3 bg-yellow-50 border border-yellow-200 rounded-xl text-sm text-yellow-900 whitespace-pre-wrap">{log}</div>
         )}
 
-        
-        {/* Overall Score */}
+       {/* Overall Score */}
         <section className="bg-white rounded-2xl shadow p-4">
           <div className="flex items-center justify-between">
             <h2 className="font-semibold">Overall Rating</h2>
@@ -547,7 +545,6 @@ function App() {
             Weighted by importance (RED=3, BLUE=2, GREEN=1, WHITE=0.5). Based only on metrics successfully computed from your photos.
           </p>
         </section>
-
 
         <section className="bg-white rounded-2xl shadow p-4">
           <div className="flex items-center justify-between">
