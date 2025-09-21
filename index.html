@@ -1,0 +1,659 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Face Metric Analyzer</title>
+    <!-- Tailwind CSS via CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- React + ReactDOM -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <!-- Babel for JSX support -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  </head>
+  <body class="bg-gray-100">
+    <div id="root"></div>
+    <script type="text/babel">
+import React, { useEffect, useRef, useState } from "react";
+
+// This single-file React app uses face-api.js (loaded from CDN at runtime)
+// to detect 68 facial landmarks on a FRONT and a SIDE profile photo, then
+// computes a subset of the requested measurements, draws overlays, and
+// color-codes results by importance and whether they fall in target ranges.
+//
+// ✅ Implemented metrics (front photo):
+//   3) Eye separation ratio (interpupillary distance / biocular width)
+//   11) FWHR (bizygomatic width / upper face height)
+//   12) Total FWHR (bizygomatic / full face height)
+//   15) Eye spacing (intercanthal / eye width)
+//   16) Upper to lower lip ratio
+//   21) Nasal projection (proxy with nasal tip to face plane / nose length) — approx
+//   22) Nasal width to height ratio
+//   23) Nose width to mouth width
+//   24) Eye aspect ratio (width / height)
+//   25) Midface ratio (subnasale→glabella / subnasale→menton) — approx
+//
+// ✅ Implemented metrics (side photo):
+//   13) Submental cervical angle — approx (jawline/neck angle)
+//   30) Nasomental angle — approx (glabella–nasion–menton surrogate)
+//   32) Nasal tip angle — approx (columella–tip–dorsum surrogate)
+//
+// ⚠️ Many of the craniofacial angles (gonial, mandibular plane, frankfurt plane, etc.)
+// require calibrated side views and anatomical landmarks that the 68-point set only
+// approximates. Those are scaffolded as "N/A" below with TODOs to upgrade to
+// MediaPipe FaceMesh or 3D models for higher fidelity and to add a pixel-to-mm scale.
+//
+// Color coding (importance):
+//   RED   = Extremely Important
+//   BLUE  = Really Important
+//   GREEN = Important
+//   WHITE = Not That Important
+//
+// The ranges from the user's specification are encoded in METRIC_DEFS target fields.
+// Results outside target range are shown in red; inside are green; unavailable are gray.
+
+const CDN = {
+  faceapi: "https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js",
+  models: "https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/", // 68-landmark compatible
+};
+
+// Utility: load a script tag once
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
+    if (document.querySelector(`script[src='${src}']`)) return resolve();
+    const s = document.createElement("script");
+    s.src = src;
+    s.async = true;
+    s.onload = resolve;
+    s.onerror = reject;
+    document.head.appendChild(s);
+  });
+}
+
+// Euclidean distance
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+// Angle at B given triangle ABC (in degrees)
+function angleAt(A, B, C) {
+  const ab = { x: A.x - B.x, y: A.y - B.y };
+  const cb = { x: C.x - B.x, y: C.y - B.y };
+  const dot = ab.x * cb.x + ab.y * cb.y;
+  const mab = Math.hypot(ab.x, ab.y);
+  const mcb = Math.hypot(cb.x, cb.y);
+  const cos = Math.min(1, Math.max(-1, dot / (mab * mcb || 1e-6)));
+  return (Math.acos(cos) * 180) / Math.PI;
+}
+
+// Linear interpolation helper for point along AB by t in [0,1]
+const lerp = (A, B, t) => ({ x: A.x + (B.x - A.x) * t, y: A.y + (B.y - A.y) * t });
+
+// Map of metric definitions with target ranges and importance color.
+// valueFn receives (lm, kind) where lm is an object of 68-landmark points and kind is 'front' | 'side'.
+const METRIC_DEFS = [
+  // ---- FRONT metrics ----
+  {
+    id: 3,
+    name: "Eye separation ratio",
+    target: [44.3, 47.4],
+    unit: "%",
+    importance: "BLUE",
+    photo: "front",
+    valueFn: (lm) => {
+      // interpupillary distance / biocular width * 100
+      const leftPupil = lm[42]; // approx inner left eye cluster center
+      const rightPupil = lm[39];
+      const ipd = dist(leftPupil, rightPupil);
+      const leftOuter = lm[36];
+      const rightOuter = lm[45];
+      const biocular = dist(leftOuter, rightOuter);
+      return (ipd / biocular) * 100;
+    },
+  },
+  {
+    id: 11,
+    name: "FWHR",
+    target: [1.9, 2.06],
+    unit: "",
+    importance: "RED",
+    photo: "front",
+    valueFn: (lm) => {
+      // bizygomatic width / upper face height
+      const zygLeft = lm[1]; // near zygion left (approx in 68 set)
+      const zygRight = lm[15];
+      const width = dist(zygLeft, zygRight);
+      const glabella = lm[27];
+      const upperLip = lm[51];
+      const height = Math.abs(glabella.y - upperLip.y);
+      return width / height;
+    },
+  },
+  {
+    id: 12,
+    name: "Total FWHR",
+    target: [1.33, 1.38],
+    unit: "",
+    importance: "BLUE",
+    photo: "front",
+    valueFn: (lm) => {
+      const zygLeft = lm[1];
+      const zygRight = lm[15];
+      const width = dist(zygLeft, zygRight);
+      const trichion = lerp(lm[19], lm[24], -0.8); // rough extrapolation above brows
+      const menton = lm[8];
+      const height = Math.abs(trichion.y - menton.y);
+      return width / height;
+    },
+  },
+  {
+    id: 15,
+    name: "Eye spacing",
+    target: [0.93, 1.04],
+    unit: "",
+    importance: "GREEN",
+    photo: "front",
+    valueFn: (lm) => {
+      // intercanthal distance / average eye width
+      const leftInner = lm[39];
+      const rightInner = lm[42];
+      const intercanthal = dist(leftInner, rightInner);
+      const leftEyeW = dist(lm[36], lm[39]);
+      const rightEyeW = dist(lm[42], lm[45]);
+      const avgEye = (leftEyeW + rightEyeW) / 2;
+      return intercanthal / avgEye;
+    },
+  },
+  {
+    id: 16,
+    name: "Upper to lower lip ratio",
+    target: [1.4, 2],
+    unit: "",
+    importance: "GREEN",
+    photo: "front",
+    valueFn: (lm) => {
+      // vertical thickness: upper (49-52 midpoint), lower (55-58 midpoint)
+      const top = lm[51];
+      const upperIn = lerp(lm[50], lm[52], 0.5);
+      const lowerIn = lerp(lm[58], lm[56], 0.5);
+      const bottom = lm[57];
+      const upperH = Math.abs(top.y - upperIn.y);
+      const lowerH = Math.abs(lowerIn.y - bottom.y);
+      return upperH / (lowerH || 1e-6);
+    },
+  },
+  {
+    id: 22,
+    name: "Nasal width to height",
+    target: [0.62, 0.88],
+    unit: "",
+    importance: "BLUE",
+    photo: "front",
+    valueFn: (lm) => {
+      const alarLeft = lm[31];
+      const alarRight = lm[35];
+      const base = lm[33]; // subnasale area
+      const rhinion = lm[27];
+      const width = dist(alarLeft, alarRight);
+      const height = Math.abs(rhinion.y - base.y);
+      return width / height;
+    },
+  },
+  {
+    id: 23,
+    name: "Nose width to mouth width",
+    target: [1.38, 1.53],
+    unit: "",
+    importance: "WHITE",
+    photo: "front",
+    valueFn: (lm) => {
+      const noseW = dist(lm[31], lm[35]);
+      const mouthW = dist(lm[48], lm[54]);
+      return mouthW ? noseW / mouthW : NaN;
+    },
+  },
+  {
+    id: 24,
+    name: "Eye aspect ratio (width/height)",
+    target: [2.8, 3.6],
+    unit: "",
+    importance: "GREEN",
+    photo: "front",
+    valueFn: (lm) => {
+      const leftW = dist(lm[36], lm[39]);
+      const leftH = (dist(lm[37], lm[41]) + dist(lm[38], lm[40])) / 2;
+      const rightW = dist(lm[42], lm[45]);
+      const rightH = (dist(lm[43], lm[47]) + dist(lm[44], lm[46])) / 2;
+      const earL = leftW / (leftH || 1e-6);
+      const earR = rightW / (rightH || 1e-6);
+      return (earL + earR) / 2;
+    },
+  },
+  {
+    id: 25,
+    name: "Midface ratio",
+    target: [0.93, 1.01],
+    unit: "",
+    importance: "BLUE",
+    photo: "front",
+    valueFn: (lm) => {
+      // (glabella→subnasale) / (subnasale→menton)
+      const glabella = lm[27];
+      const subnasale = lm[33];
+      const menton = lm[8];
+      const a = Math.abs(glabella.y - subnasale.y);
+      const b = Math.abs(subnasale.y - menton.y);
+      return a / (b || 1e-6);
+    },
+  },
+  {
+    id: 21,
+    name: "Nasal projection (proxy)",
+    target: [0.55, 0.68],
+    unit: "",
+    importance: "WHITE",
+    photo: "front",
+    valueFn: (lm) => {
+      // Proxy using tip forwardness vs nose length in 2D front — rough estimate
+      const tip = lm[34];
+      const base = lm[33];
+      const bridge = lm[27];
+      const length = dist(bridge, base);
+      const proj = Math.abs(tip.x - base.x);
+      return length ? proj / length : NaN;
+    },
+  },
+
+  // ---- SIDE metrics (very approximate with 2D landmarks) ----
+  {
+    id: 13,
+    name: "Submental cervical angle (approx)",
+    target: [91, 110],
+    unit: "°",
+    importance: "RED",
+    photo: "side",
+    valueFn: (lm) => {
+      // Using menton (8), throat point (approx 9), neck base (approx 6) as a proxy
+      const menton = lm[8];
+      const throat = lm[9];
+      const neck = lm[6];
+      return angleAt(throat, menton, neck);
+    },
+  },
+  {
+    id: 30,
+    name: "Nasomental angle (approx)",
+    target: [125, 132],
+    unit: "°",
+    importance: "BLUE",
+    photo: "side",
+    valueFn: (lm) => {
+      const noseTip = lm[34];
+      const nasion = lm[27];
+      const menton = lm[8];
+      return angleAt(noseTip, nasion, menton);
+    },
+  },
+  {
+    id: 32,
+    name: "Nasal tip angle (approx)",
+    target: [112, 125],
+    unit: "°",
+    importance: "WHITE",
+    photo: "side",
+    valueFn: (lm) => {
+      const columella = lm[33];
+      const tip = lm[34];
+      const dorsum = lm[27];
+      return angleAt(columella, tip, dorsum);
+    },
+  },
+];
+
+const IMPORTANCE_COLOR = {
+  RED: "bg-red-100 text-red-800 border-red-300",
+  BLUE: "bg-blue-100 text-blue-800 border-blue-300",
+  GREEN: "bg-green-100 text-green-800 border-green-300",
+  WHITE: "bg-gray-50 text-gray-700 border-gray-200",
+};
+
+function within([lo, hi], v) {
+  if (!isFinite(v)) return false;
+  return v >= lo && v <= hi;
+}
+
+function formatVal(v, unit) {
+  if (!isFinite(v)) return "N/A";
+  const rounded = Math.abs(v) >= 10 ? v.toFixed(1) : v.toFixed(2);
+  return `${rounded}${unit ?? ""}`;
+}
+
+function App() {
+  const [ready, setReady] = useState(false);
+  const [frontImg, setFrontImg] = useState(null);
+  const [sideImg, setSideImg] = useState(null);
+  const [metrics, setMetrics] = useState([]);
+  const [busy, setBusy] = useState(false);
+  const frontCanvasRef = useRef(null);
+  const sideCanvasRef = useRef(null);
+  const [log, setLog] = useState("");
+
+  useEffect(() => {
+    (async () => {
+      try {
+        await loadScript(CDN.faceapi);
+        // @ts-ignore
+        const faceapi = window.faceapi;
+        await faceapi.nets.tinyFaceDetector.loadFromUri(CDN.models);
+        await faceapi.nets.faceLandmark68TinyNet.loadFromUri(CDN.models);
+        setReady(true);
+      } catch (err) {
+        console.error(err);
+        setLog("Failed to load models. Check network/permissions.");
+      }
+    })();
+  }, []);
+
+  const run = async () => {
+    setBusy(true);
+    setLog("");
+    try {
+      // @ts-ignore
+      const faceapi = window.faceapi;
+      const nextMetrics = [];
+
+      // Analyze FRONT
+      if (frontImg && frontCanvasRef.current) {
+        const det = await faceapi
+          .detectSingleFace(frontImg, new faceapi.TinyFaceDetectorOptions())
+          .withFaceLandmarks(true);
+        if (det?.landmarks) {
+          const lm = det.landmarks.positions; // array of 68 points with x,y
+          drawOverlay(frontImg, frontCanvasRef.current, lm, "front");
+          for (const def of METRIC_DEFS.filter((d) => d.photo === "front")) {
+            let val = NaN;
+            try {
+              val = def.valueFn(lm, "front");
+            } catch {}
+            nextMetrics.push({
+              id: def.id,
+              name: def.name,
+              value: val,
+              formatted: formatVal(val, def.unit),
+              target: def.target,
+              ok: within(def.target, val),
+              importance: def.importance,
+              photo: "front",
+            });
+          }
+        } else {
+          setLog((s) => s + "\nNo face detected in front photo.");
+        }
+      }
+
+      // Analyze SIDE
+      if (sideImg && sideCanvasRef.current) {
+        const det = await faceapi
+          .detectSingleFace(sideImg, new faceapi.TinyFaceDetectorOptions())
+          .withFaceLandmarks(true);
+        if (det?.landmarks) {
+          const lm = det.landmarks.positions;
+          drawOverlay(sideImg, sideCanvasRef.current, lm, "side");
+          for (const def of METRIC_DEFS.filter((d) => d.photo === "side")) {
+            let val = NaN;
+            try {
+              val = def.valueFn(lm, "side");
+            } catch {}
+            nextMetrics.push({
+              id: def.id,
+              name: def.name,
+              value: val,
+              formatted: formatVal(val, def.unit),
+              target: def.target,
+              ok: within(def.target, val),
+              importance: def.importance,
+              photo: "side",
+            });
+          }
+        } else {
+          setLog((s) => s + "\nNo face detected in side photo.");
+        }
+      }
+
+      // Add placeholders for non-implemented metrics so the UI lists all items
+      const implementedIds = new Set(METRIC_DEFS.map((d) => d.id));
+      const ALL_IDS = [
+        1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,
+      ];
+      const IMPORTANCE_BY_ID = {
+        1: "RED",2: "BLUE",3: "BLUE",4: "BLUE",5: "BLUE",6: "GREEN",7: "BLUE",8: "BLUE",9: "GREEN",10: "GREEN",11: "RED",12: "BLUE",13: "RED",14: "GREEN",15: "GREEN",16: "GREEN",17: "GREEN",18: "WHITE",19: "GREEN",20: "GREEN",21: "WHITE",22: "BLUE",23: "WHITE",24: "GREEN",25: "BLUE",26: "GREEN",27: "RED",28: "BLUE",29: "GREEN",30: "BLUE",31: "GREEN",32: "WHITE",33: "GREEN",34: "GREEN",35: "WHITE",36: "WHITE",37: "GREEN",38: "BLUE",
+      };
+      const TARGET_BY_ID = {
+        1:[112,123],2:[29.5,36.5],3:[44.3,47.4],4:[137.5,148.5],5:[168,176],6:[81,100],7:[84.5,95],8:[15,22],9:[5.2,8.5],10:[0.59,0.78],11:[1.9,2.06],12:[1.33,1.38],13:[91,110],14:[106,129],15:[0.93,1.04],16:[1.4,2],17:[30,36],18:[0,0.65],19:[2.05,2.55],20:[94,117],21:[0.55,0.68],22:[0.62,0.88],23:[1.38,1.53],24:[2.8,3.6],25:[0.93,1.01],26:[90,100],27:[0,0],28:[85.5,92],29:[20.42,20.42],30:[125,132],31:[1,1],32:[112,125],33:[1,1],34:[108,130],35:[5,13],36:[13,24],37:[30.6,34],38:[84,95],
+      };
+
+      for (const id of ALL_IDS) {
+        if ([...implementedIds].includes(id)) continue; // already computed above
+        const photo = [13,30,32].includes(id) ? "side" : "front";
+        nextMetrics.push({
+          id,
+          name: metricNameFromId(id),
+          value: NaN,
+          formatted: "N/A",
+          target: TARGET_BY_ID[id],
+          ok: false,
+          importance: IMPORTANCE_BY_ID[id],
+          photo,
+        });
+      }
+
+      // Sort by importance then id
+      nextMetrics.sort((a, b) => {
+        const rank = { RED: 0, BLUE: 1, GREEN: 2, WHITE: 3 };
+        const r = rank[a.importance] - rank[b.importance];
+        return r !== 0 ? r : a.id - b.id;
+      });
+
+      setMetrics(nextMetrics);
+    } catch (e) {
+      console.error(e);
+      setLog("Something went wrong while analyzing. Try different photos.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  function onFile(setter) {
+    return (e) => {
+      const file = e.target.files?.[0];
+      if (!file) return;
+      const url = URL.createObjectURL(file);
+      const img = new Image();
+      img.onload = () => setter(img);
+      img.src = url;
+    };
+  }
+
+  return (
+    <div className="min-h-screen bg-gray-50 p-6">
+      <div className="max-w-6xl mx-auto space-y-6">
+        <header className="flex items-center justify-between">
+          <h1 className="text-2xl font-bold">Face Metric Analyzer</h1>
+          <div className="text-sm text-gray-600">Client-side • No upload</div>
+        </header>
+
+        <section className="grid grid-cols-1 md:grid-cols-2 gap-6">
+          <div className="bg-white rounded-2xl shadow p-4">
+            <h2 className="font-semibold mb-2">Front Photo</h2>
+            <input type="file" accept="image/*" onChange={onFile(setFrontImg)} />
+            <div className="mt-3 border rounded-xl overflow-hidden flex items-center justify-center bg-gray-100" style={{height: 360}}>
+              <canvas ref={frontCanvasRef} className="max-h-[360px]" />
+            </div>
+          </div>
+          <div className="bg-white rounded-2xl shadow p-4">
+            <h2 className="font-semibold mb-2">Side Photo</h2>
+            <input type="file" accept="image/*" onChange={onFile(setSideImg)} />
+            <div className="mt-3 border rounded-xl overflow-hidden flex items-center justify-center bg-gray-100" style={{height: 360}}>
+              <canvas ref={sideCanvasRef} className="max-h-[360px]" />
+            </div>
+          </div>
+        </section>
+
+        <div className="flex gap-3">
+          <button
+            disabled={!ready || busy || (!frontImg && !sideImg)}
+            onClick={run}
+            className="px-4 py-2 rounded-xl bg-black text-white disabled:opacity-40"
+          >
+            {busy ? "Analyzing…" : "Analyze"}
+          </button>
+          <span className="text-sm text-gray-600">Models: {ready ? "Loaded" : "Loading…"}</span>
+        </div>
+
+        {log && (
+          <div className="p-3 bg-yellow-50 border border-yellow-200 rounded-xl text-sm text-yellow-900 whitespace-pre-wrap">{log}</div>
+        )}
+
+        <section className="bg-white rounded-2xl shadow p-4">
+          <div className="flex items-center justify-between">
+            <h2 className="font-semibold">Results</h2>
+            <Legend />
+          </div>
+          <div className="mt-4 grid md:grid-cols-2 gap-4">
+            {metrics.map((m) => (
+              <div key={`${m.id}-${m.photo}`} className={`border rounded-xl p-3 ${IMPORTANCE_COLOR[m.importance]}`}>
+                <div className="flex items-center justify-between">
+                  <div className="font-semibold">{m.id}. {m.name}</div>
+                  <div className={`text-sm font-mono px-2 py-1 rounded ${m.formatted !== "N/A" ? (m.ok ? "bg-green-600 text-white" : "bg-red-600 text-white") : "bg-gray-300 text-gray-800"}`}>
+                    {m.formatted}
+                  </div>
+                </div>
+                <div className="text-xs mt-1 text-gray-700">Target: {m.target?.[0]}–{m.target?.[1]}{m.name.includes("°")?"°":""}</div>
+                <div className="text-xs mt-1 text-gray-600">Photo: {m.photo}</div>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <footer className="text-xs text-gray-500">
+          Notes: These measurements are 2D approximations from 68-point landmarks and consumer photos.
+          For professional craniofacial assessment, use calibrated photos and 3D landmarks (e.g., MediaPipe FaceMesh).
+        </footer>
+      </div>
+    </div>
+  );
+}
+
+function Legend() {
+  return (
+    <div className="flex gap-2 items-center text-xs">
+      <span className="px-2 py-1 rounded-lg border bg-red-100 text-red-800 border-red-300">RED</span>
+      <span className="px-2 py-1 rounded-lg border bg-blue-100 text-blue-800 border-blue-300">BLUE</span>
+      <span className="px-2 py-1 rounded-lg border bg-green-100 text-green-800 border-green-300">GREEN</span>
+      <span className="px-2 py-1 rounded-lg border bg-gray-50 text-gray-700 border-gray-200">WHITE</span>
+    </div>
+  );
+}
+
+function metricNameFromId(id) {
+  const map = {
+    1: "Gonial angle",
+    2: "Facial thirds",
+    3: "Eye separation ratio",
+    4: "Total facial convexity angle",
+    5: "Facial convexity angle",
+    6: "Cheekbone position",
+    7: "Jaw frontal angle",
+    8: "Mandibular plane angle",
+    9: "Canthal Tilt (palpebral axis)",
+    10: "Ramus to mandible ratio",
+    11: "FWHR",
+    12: "Total FWHR",
+    13: "Submental cervical angle",
+    14: "Nasofrontal angle",
+    15: "Eye spacing",
+    16: "Upper to lower lip ratio",
+    17: "Nasofacial angle",
+    18: "Eyebrow position",
+    19: "Chin to philtrum",
+    20: "Mentolabial (nasolabial in prompt) angle",
+    21: "Nasal projection",
+    22: "Nasal width to height",
+    23: "Nose width to mouth width",
+    24: "Eye aspect ratio",
+    25: "Midface ratio",
+    26: "Neck width",
+    27: "Recession vs Frankfurt plane",
+    28: "Bigonial width",
+    29: "Medial canthal angle",
+    30: "Nasomental angle",
+    31: "Orbital vector",
+    32: "Nasal tip angle",
+    33: "Gonion to mouth",
+    34: "Mentolabial angle",
+    35: "Eyebrow tilt",
+    36: "Brow ridge inclination",
+    37: "Lower facial proportion",
+    38: "Bitemporal width",
+  };
+  return map[id] || `Metric ${id}`;
+}
+
+function drawOverlay(img, canvas, lm, kind) {
+  const ctx = canvas.getContext("2d");
+  const maxW = 520;
+  const scale = Math.min(maxW / img.width, 360 / img.height);
+  canvas.width = img.width * scale;
+  canvas.height = img.height * scale;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+  ctx.save();
+  ctx.scale(scale, scale);
+
+  // Draw landmarks (small points)
+  ctx.fillStyle = "rgba(0,0,0,0.6)";
+  for (const p of lm) {
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, 1.5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // Draw key overlay lines for implemented metrics
+  // Eyes
+  stroke(ctx, lm[36], lm[39], "#22c55e", 2);
+  stroke(ctx, lm[42], lm[45], "#22c55e", 2);
+  stroke(ctx, lm[37], lm[41], "#ef4444", 1);
+  stroke(ctx, lm[38], lm[40], "#ef4444", 1);
+
+  // Intercanthal
+  stroke(ctx, lm[39], lm[42], "#3b82f6", 2);
+
+  // Bizygomatic
+  stroke(ctx, lm[1], lm[15], "#22c55e", 2);
+  // Upper face height (glabella to upper lip)
+  stroke(ctx, lm[27], lm[51], "#22c55e", 2);
+
+  // Nose width & height
+  stroke(ctx, lm[31], lm[35], "#3b82f6", 2);
+  stroke(ctx, lm[27], lm[33], "#3b82f6", 2);
+
+  // Mouth width
+  stroke(ctx, lm[48], lm[54], "#a855f7", 2);
+
+  ctx.restore();
+}
+
+function stroke(ctx, A, B, color = "#10b981", w = 2) {
+  ctx.beginPath();
+  ctx.moveTo(A.x, A.y);
+  ctx.lineTo(B.x, B.y);
+  ctx.lineWidth = w;
+  ctx.strokeStyle = color;
+  ctx.stroke();
+}
+
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<App />);
+
+    </script>
+  </body>
+</html>
